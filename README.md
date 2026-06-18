@@ -1,4 +1,4 @@
-# Msc-thesis-analysis-
+
 # MSc Thesis Analysis
 
 This repository contains the R code used for my MSc dissertation analysis titled:
