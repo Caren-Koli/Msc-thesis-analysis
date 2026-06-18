@@ -33,3 +33,7 @@ The code follows the main thesis workflow:
 
 The raw STEPs survey dataset is not included in this repository because of data access restrictions. The code is provided for transparency and reproducibility of the analytical workflow used in the thesis.
 
+## Author
+Caren Koli
+Strathmore University,
+June 2026
