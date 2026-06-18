@@ -23,7 +23,7 @@ library(cmdstanr)
 
 ```{r data-prep}
 # Read raw STEPs data
-data <- read_dta("C:\\Users\\EDWIN\\Downloads\\2015 STEPS Data.dta")
+data <- read_dta("C:\****\\2015 STEPS Data.dta") 
 
 data1 <- data |>
   select(
