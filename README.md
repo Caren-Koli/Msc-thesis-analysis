@@ -33,7 +33,10 @@ The code follows the main thesis workflow:
 
 The raw STEPs survey dataset is not included in this repository because of data access restrictions. The code is provided for transparency and reproducibility of the analytical workflow used in the thesis.
 
+## License
+This repository is provided for academic transparency and reproducibility of the thesis analysis. The R code may be reused or adapted for academic and non-commercial purposes with appropriate acknowledgement.
+
 ## Author
-Caren Koli
+Caren Koli,
 Strathmore University,
 June 2026
