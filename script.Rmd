@@ -1,0 +1,1359 @@
+---
+title: "A Comparative Evaluation of Bayesian and Frequentist Logistic Regression Models in Estimating Risk of Hypertension: Application to Multilevel STEPs Survey Data"
+author: "Koli Caren"
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r packages}
+pacman::p_load(
+  haven, tidyverse, labelled, janitor, lubridate,
+  survey, brms, lme4, srvyr, loo, bayesplot, posterior,
+  tidybayes, ggdist, patchwork, marginaleffects, gt, gtsummary,
+  broom.mixed
+)
+library(cmdstanr)
+```
+
+
+```{r data-prep}
+# Read raw STEPs data
+data <- read_dta("C:\\Users\\EDWIN\\Downloads\\2015 STEPS Data.dta")
+
+data1 <- data |>
+  select(
+    PID, X1,
+    "Sex"               = C1,
+    "Age"               = C3,
+    "Marital_status"    = C7,
+    "Residence"         = X2a,
+    "Education"         = C5,
+    "htn_diagnosed"     = H2a,
+    "htn_diagnosed_12m" = H2b,
+    "htn_treated_2w"    = H3,
+    "systolic_bp_1"     = M4a,
+    "diastolic_bp_1"    = M4b,
+    "systolic_bp_2"     = M5a,
+    "diastolic_bp_2"    = M5b,
+    "systolic_bp_3"     = M6a,
+    "diastolic_bp_3"    = M6b,
+    "diabetes_diagnosed"          = H7a,
+    "salt_added_at_table"         = D5,
+    "salt_added_during_cooking"   = D6,
+    "processed_high_salt_food_freq" = D7,
+    "diabetes_med_2w"   = H8,
+    "insulin_use"       = H9,
+    "tobaco_current"    = T1,
+    "smokeless_current" = T6,
+    "vigorous_work_days" = P2,  "vigorous_work_min" = P3b,
+    "moderate_work_days" = P5,  "moderate_work_min" = P6b,
+    "transport_days"     = P8,  "transport_min"     = P9b,
+    "vigorous_rec_days"  = P11, "vigorous_rec_min"  = P12b,
+    "moderate_rec_days"  = P14, "moderate_rec_min"  = P15b,
+    "type_of_oil"       = D12,
+    "eat_outside"       = D13,
+    "day_of_interview"   = I4a, "month_of_interview" = I4b, "year_of_interview" = I4c,
+    "day_of_birth"       = C2a, "month_of_birth"     = C2b, "year_of_birth"     = C2c,
+    "height" = M11, "weight" = M12,
+    "alcohol_ever"    = A1,
+    "salt_added_freq" = D5,
+    "cluster"         = I1,
+    "household_id"    = I2,
+    starts_with("A"),
+    wealth, psu, stratum, wstep3
+  ) |>
+  mutate(
+    # Hypertension (composite WHO STEPs definition)
+    systolic  = (systolic_bp_2 + systolic_bp_3) / 2,
+    diastolic = (diastolic_bp_2 + diastolic_bp_3) / 2,
+    hypertension = case_when(
+      systolic >= 140 | diastolic >= 90 |
+        htn_diagnosed == 1 | htn_treated_2w == 1 ~ 1,
+      .default = 0
+    ),
+    htn_measured_only  = ifelse(systolic >= 140 | diastolic >= 90, 1, 0),
+    htn_diagnosed_only = ifelse(htn_diagnosed == 1, 1, 0),
+    htn_treated_only   = ifelse(htn_treated_2w == 1, 1, 0),
+
+    # Age
+    birth_date     = make_date(year_of_birth,     month_of_birth,     day_of_birth),
+    interview_date = make_date(year_of_interview, month_of_interview, day_of_interview),
+    age_computed   = floor(time_length(interval(birth_date, interview_date), "years")),
+    Age_s = case_when(
+      !is.na(Age)                                    ~ Age,
+      !is.na(age_computed) & age_computed >= 18      ~ age_computed,
+      TRUE                                           ~ NA_real_
+    ),
+    Age_s = cut(Age_s,
+                breaks = c(18, 25, 30, 35, 40, 45, 50, 60, 70),
+                labels = c("18-24","25-29","30-34","35-39","40-44","45-49","50-59","60-70"),
+                right  = FALSE),
+
+    # Education
+    Education = recode(Education,
+      "No formal schooling"          = "No schooling",
+      "Primary school incomplete"    = "Incomplete primary",
+      "Primary school completed"     = "Complete primary",
+      "Secondary school incomplete"  = "Secondary",
+      "Secondary school completed"   = "Secondary",
+      "A-Level completed"            = "Post-secondary",
+      "College/University completed" = "Post-secondary",
+      "Post-graduate degree"         = "Post-secondary"
+    ),
+
+    # BMI
+    bmi     = weight / (height / 100)^2,
+    bmi_cat = case_when(
+      bmi < 18.5              ~ "Underweight",
+      bmi >= 18.5 & bmi < 25 ~ "Normal",
+      bmi >= 25   & bmi < 30 ~ "Overweight",
+      bmi >= 30               ~ "Obese",
+      TRUE                    ~ NA_character_
+    ),
+    bmi_cat = factor(bmi_cat, levels = c("Normal","Underweight","Overweight","Obese")),
+
+    # Diabetes
+    has_diabetes = case_when(
+      diabetes_diagnosed == 1 | diabetes_med_2w == 1 | insulin_use == 1 ~ "Yes",
+      TRUE ~ "No"
+    ),
+
+    # Salt
+    high_salt_intake = case_when(
+      salt_added_at_table %in% c(1,2) |
+        salt_added_during_cooking %in% c(1,2) |
+        processed_high_salt_food_freq %in% c(1,2) ~ "Yes",
+      TRUE ~ "No"
+    ),
+
+    # Tobacco
+    current_smoker = case_when(
+      tobaco_current == 1 | smokeless_current == 1 ~ "Yes",
+      TRUE ~ "No"
+    ),
+
+    # Alcohol
+    weekly_alcohol_consumption = rowSums(across(A10a:A10g, ~replace_na(., 0))) +
+      coalesce(A12a,0) + coalesce(A12b,0) + coalesce(A12c,0) +
+      coalesce(A12d,0) + coalesce(A12e,0),
+    heavy_episodic_drinking = replace_na(ifelse(A8 >= 1, 1, 0), 0),
+    high_weekly_intake = case_when(
+      Sex == "Male"   & weekly_alcohol_consumption >= 14 ~ 1,
+      Sex == "Female" & weekly_alcohol_consumption >= 7  ~ 1,
+      TRUE ~ 0
+    ),
+    high_alcohol_intake = case_when(
+      heavy_episodic_drinking == 1 | high_weekly_intake == 1 ~ "Yes",
+      TRUE ~ "No"
+    ),
+
+    # Fat
+    type_of_oil  = ifelse(type_of_oil == 77, NA, type_of_oil),
+    eat_outside  = ifelse(eat_outside  == 77, NA, eat_outside),
+    high_saturated_fat_oil = ifelse(type_of_oil %in% c(3,4,6,7), 1, 0),
+    high_outside_meals     = ifelse(eat_outside >= 3, 1, 0),
+    high_fat_intake = case_when(
+      high_saturated_fat_oil == 1 | high_outside_meals == 1 ~ "Yes",
+      TRUE ~ "No"
+    ),
+
+    # Physical activity
+    across(c(vigorous_work_days, vigorous_work_min,
+             moderate_work_days, moderate_work_min,
+             transport_days, transport_min,
+             vigorous_rec_days, vigorous_rec_min,
+             moderate_rec_days, moderate_rec_min),
+           ~replace_na(.x, 0)),
+    vigorous_minutes = (vigorous_work_days * vigorous_work_min) +
+                       (vigorous_rec_days  * vigorous_rec_min),
+    moderate_minutes = (moderate_work_days * moderate_work_min) +
+                       (moderate_rec_days  * moderate_rec_min) +
+                       (transport_days     * transport_min),
+    insufficient_activity = case_when(
+      vigorous_minutes >= 75                                  ~ "No",
+      moderate_minutes >= 150                                 ~ "No",
+      (moderate_minutes + 2 * vigorous_minutes) >= 150        ~ "No",
+      TRUE                                                    ~ "Yes"
+    ),
+
+    Marital_status = ifelse(Marital_status == "", NA, Marital_status),
+    Residence      = factor(Residence, labels = c("Rural","Urban")),
+    Region = case_when(
+      X1 %in% c(13,15,29,35,36,30)             ~ "Nairobi-Central",
+      X1 %in% c(28,14,19,21,39,40,7,46,24)     ~ "Coast-North Eastern",
+      X1 %in% c(6,9,18,22,23,25,26,41)         ~ "Eastern",
+      X1 %in% c(8,16,17,27,34,38,3,4,11,42,45) ~ "Nyanza-Western",
+      X1 %in% c(1,2,5,10,12,20,31,32,33,37,43,44,47) ~ "Rift Valley"
+    )
+  ) |>
+  filter(!is.na(Marital_status), wstep3 > 0) |>
+  mutate(across(where(is.character), factor)) |>
+  select(PID, Age_s, Sex, Education, wealth, Residence,
+         Marital_status, bmi_cat, high_salt_intake, current_smoker,
+         has_diabetes, high_alcohol_intake, insufficient_activity,
+         high_fat_intake, Region, household_id, cluster, psu, stratum,
+         wstep3, hypertension, htn_measured_only, htn_diagnosed_only, htn_treated_only)
+
+model_vars <- c("Age_s", "Sex", "bmi_cat", "has_diabetes", "current_smoker",
+                "high_alcohol_intake", "high_fat_intake", "high_salt_intake",
+                "insufficient_activity", "Education", "wealth", "Residence", "Region")
+
+f_fixed <- hypertension ~ Age_s + Sex + bmi_cat + has_diabetes + current_smoker +
+  high_alcohol_intake + high_fat_intake + high_salt_intake +
+  insufficient_activity + Education + wealth + Residence + Region
+```
+
+
+```{r hierarchy-diagnosis}
+# Summarize the overall hierarchical structure of the dataset
+data1 |>
+  summarise(
+    n_rows           = n(),
+    n_I1_cluster     = n_distinct(cluster),
+    n_I2_household   = n_distinct(household_id),
+    n_psu            = n_distinct(psu),
+    n_stratum        = n_distinct(stratum)
+  )
+
+# Examine household distribution within each cluster
+data1 |>
+  group_by(cluster) |>
+  summarise(hh_in_cluster = n_distinct(household_id), .groups = "drop") |>
+  summarise(across(hh_in_cluster, list(mean = mean, min = min, max = max)))
+
+# Different level-2 grouping
+data1 |>
+  mutate(
+    key_I2_only    = as.character(household_id),
+    key_cluster_I2 = paste(cluster, household_id, sep = "_"),
+    key_psu_I2     = paste(psu, household_id, sep = "_")
+  ) |>
+  summarise(
+    n_groups_I2_only    = n_distinct(key_I2_only),
+    size_I2_only        = round(n() / n_distinct(key_I2_only), 1),
+    n_groups_cluster_I2 = n_distinct(key_cluster_I2),
+    size_cluster_I2     = round(n() / n_distinct(key_cluster_I2), 1),
+    n_groups_psu_I2     = n_distinct(key_psu_I2),
+    size_psu_I2         = round(n() / n_distinct(key_psu_I2), 1)
+  )
+```
+
+
+```{r sample-reconciliation}
+# Check missing values for all variables and outcome
+data1 |>
+  select(all_of(model_vars), hypertension, Marital_status) |>
+  summarise(across(everything(), ~ sum(is.na(.x)))) |>
+  pivot_longer(everything(), names_to = "Variable", values_to = "n_missing") |>
+  mutate(pct = round(100 * n_missing / nrow(data1), 1)) |>
+  arrange(desc(n_missing)) |>
+  print(n = 20)
+
+# Create complete-case dataset by removing rows with missing values
+# in any modeling variable or the outcome
+analytic <- data1 |> drop_na(all_of(model_vars), hypertension)
+
+nrow(data1)
+
+#Number after removing missing values 
+nrow(analytic)
+```
+
+
+```{r set-keys}
+# Prepare survey weights and PSU identifier for analysis
+analytic <- analytic |>
+  mutate(
+    psu_id      = psu,
+    weight_norm = wstep3 * (n() / sum(wstep3, na.rm = TRUE)),
+    weight_norm = ifelse(is.na(weight_norm), 1, weight_norm)
+  )
+
+# Summarize PSU structure in analytic dataset
+analytic |>
+  summarise(
+    n_individuals = n(),
+    n_psu         = n_distinct(psu_id),
+    indiv_per_psu = round(n() / n_distinct(psu_id), 1)
+  ) |> print()
+
+# Compute effective sample size by weights
+ess_weights <- sum(analytic$weight_norm)^2 / sum(analytic$weight_norm^2)
+ess_weights
+```
+
+
+```{r table1-baseline}
+# Descriptive summary table by hypertension status
+analytic |>
+  mutate(hypertension = factor(hypertension, levels = c(0,1),
+                               labels = c("No hypertension","Hypertension"))) |>
+  select(all_of(model_vars), hypertension) |>
+  tbl_summary(by = hypertension,
+              statistic = all_categorical() ~ "{n} ({p}%)",
+              missing = "ifany") |>
+  add_overall() |>
+  add_p()
+```
+
+```{r weight-diagnostics}
+w    <- analytic$weight_norm
+ess  <- sum(w)^2 / sum(w^2)
+
+#design effect due to weighting
+deff <- length(w) / ess
+
+deff
+```
+
+```{r survey-design}
+# Survey design object
+analytic_svy <- svydesign(
+  ids     = ~psu,
+  strata  = ~stratum,
+  weights = ~wstep3,
+  data    = analytic,
+  nest    = TRUE
+)
+```
+
+
+```{r marginal-models}
+# Frequentist logistic 
+model_freq_logistic <- svyglm(
+  update(f_fixed, . ~ .),
+  design = analytic_svy,
+  family = quasibinomial(link = "logit")
+)
+
+# Modified Poisson 
+model_freq_poisson <- svyglm(
+  update(f_fixed, . ~ .),
+  design = analytic_svy,
+  family = quasipoisson(link = "log")
+)
+```
+
+```{r prior-check}
+prior_single <- c(
+  prior(normal(0, 2.5), class = "Intercept"),
+  prior(normal(0, 1),   class = "b")
+)
+
+# Prior predictive check 
+model_bayes_prior <- brm(
+  update(f_fixed, . | weights(weight_norm) ~ .),
+  data         = analytic,
+  family       = bernoulli(),
+  prior        = prior_single,
+  sample_prior = "only",
+  chains       = 2, iter = 2000,
+  seed         = 123
+)
+
+set.seed(124)
+pp_check(model_bayes_prior, type = "stat", stat = "mean") +
+  theme_minimal()
+```
+
+```{r bayes-single}
+#Bayesian logistic regression model with survey weights
+model_bayes_single <- brm(
+  update(f_fixed, . | weights(weight_norm) ~ .),
+  data    = analytic,
+  family  = bernoulli(link = "logit"),
+  prior   = prior_single,
+  chains  = 4, iter = 4000, warmup = 2000,
+  seed    = 123,
+  backend = "cmdstanr",
+  threads = threading(2)
+)
+
+# Marginal RRs via G-computation
+freq_logistic_RRs <- avg_comparisons(
+  model_freq_logistic,
+  comparison = "ratio", conf_level = 0.95,
+  wts        = model_freq_logistic$weights
+) |>
+  as.data.frame() |>
+  mutate(Model = "Freq Logistic (Marginal RR)")
+
+poisson_RRs <- data.frame(
+  term      = names(coef(model_freq_poisson))[-1],
+  estimate  = exp(coef(model_freq_poisson))[-1],
+  conf.low  = exp(confint(model_freq_poisson))[-1, 1],
+  conf.high = exp(confint(model_freq_poisson))[-1, 2]
+) |>
+  mutate(Model = "Modified Poisson (RR)")
+
+bayes_RRs <- avg_comparisons(
+  model_bayes_single,
+  comparison = "ratio", conf_level = 0.95,
+  wts        = analytic$weight_norm,
+  ndraws     = 1000
+) |>
+  as.data.frame() |>
+  select(term, contrast, estimate, conf.low, conf.high) |>
+  mutate(Model = "Bayesian Logistic (Marginal RR)")
+```
+
+```{r table-objective-1}
+clean_poisson_terms <- \(df) {
+  df |> mutate(
+    Variable = case_when(
+      str_detect(term, "Age_s")    ~ "Age_s",
+      str_detect(term, "Sex")      ~ "Sex",
+      str_detect(term, "bmi_cat")  ~ "bmi_cat",
+      str_detect(term, "Education") ~ "Education",
+      str_detect(term, "wealth")   ~ "wealth",
+      str_detect(term, "Residence") ~ "Residence",
+      str_detect(term, "diabetes") ~ "has_diabetes",
+      str_detect(term, "smoker")   ~ "current_smoker",
+      str_detect(term, "alcohol")  ~ "high_alcohol_intake",
+      str_detect(term, "fat")      ~ "high_fat_intake",
+      str_detect(term, "salt")     ~ "high_salt_intake",
+      TRUE ~ term
+    ),
+    Level = str_remove(term, Variable)
+  )
+}
+
+gcomp_clean  <- bind_rows(bayes_RRs, freq_logistic_RRs) |>
+  mutate(Variable = term,
+         Level    = str_extract(contrast, "(?<=mean\\().+?(?=\\))"))
+poisson_clean <- poisson_RRs |> clean_poisson_terms()
+
+table_objective_1 <- bind_rows(gcomp_clean, poisson_clean) |>
+  mutate(
+    Estimate_CI = sprintf("%.2f (%.2f, %.2f)", estimate, conf.low, conf.high),
+    Model_Short = case_when(
+      str_detect(Model, "Bayesian") ~ "Bayesian RR",
+      str_detect(Model, "Freq Logistic") ~ "Logistic RR",
+      str_detect(Model, "Poisson")  ~ "Poisson RR"
+    )
+  ) |>
+  select(Variable, Level, Model_Short, Estimate_CI) |>
+  pivot_wider(names_from = Model_Short, values_from = Estimate_CI) |>
+  group_by(Variable) |>
+  gt() |>
+  tab_header(
+    title    = "Comparative Analysis of Hypertension Risk Factors",
+    subtitle = "Risk Ratios (95% CI) across Frequentist and Bayesian Frameworks"
+  ) |>
+  tab_style(style = list(cell_text(weight = "bold")),
+            locations = cells_row_groups()) |>
+  tab_footnote("Estimates derived using Design-Weighted G-Computation.",
+               locations = cells_column_labels(columns = contains("Logistic"))) |>
+  tab_footnote("Estimates derived using Pseudo-Posterior Weighted G-Computation.",
+               locations = cells_column_labels(columns = contains("Bayesian"))) |>
+  sub_missing(missing_text = "-")
+
+table_objective_1
+```
+
+
+```{r freq-2level}
+model_freq_2level <- glmer(
+  update(f_fixed, . ~ . + (1 | psu_id)),
+  data    = analytic,
+  family  = binomial(),
+  control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))
+)
+
+vc_2level      <- as.data.frame(VarCorr(model_freq_2level))
+sigma2_psu     <- vc_2level$vcov[1]
+icc_psu_freq   <- sigma2_psu / (sigma2_psu + pi^2 / 3)
+icc_psu_freq
+```
+
+```{r bayes-2level}
+prior_2level <- c(
+  prior(normal(0, 2.5), class = "Intercept"),
+  prior(normal(0, 1),   class = "b"),
+  prior(normal(0, 1),   class = "sd")
+)
+
+model_bayes_2level <- brm(
+  update(f_fixed, . | weights(weight_norm) ~ . + (1 | psu_id)),
+  data    = analytic,
+  family  = bernoulli(),
+  prior   = prior_2level,
+  chains  = 4, iter = 4000, warmup = 2000,
+  control = list(adapt_delta = 0.95),
+  seed    = 123,
+  backend = "cmdstanr"
+)
+
+icc_psu_bayes <- model_bayes_2level |>
+  spread_draws(sd_psu_id__Intercept) |>
+  mutate(sigma2_psu = sd_psu_id__Intercept^2,
+         icc        = sigma2_psu / (sigma2_psu + pi^2 / 3)) |>
+  median_qi(icc, .width = 0.95)
+icc_psu_bayes
+```
+
+
+```{r freq-3level-sensitivity}
+model_freq_3level <- glmer(
+  update(f_fixed, . ~ . + (1 | psu_id/household_id)),
+  data    = analytic,
+  family  = binomial(),
+  control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))
+)
+
+vc_3level         <- as.data.frame(VarCorr(model_freq_3level))
+sigma2_psu_3lvl   <- vc_3level$vcov[vc_3level$grp == "psu_id"]
+sigma2_hh_3level  <- vc_3level$vcov[vc_3level$grp == "household_id:psu_id"]
+total_var         <- sigma2_psu_3lvl + sigma2_hh_3level + pi^2 / 3
+icc_psu_3lvl       <- sigma2_psu_3lvl  / total_var
+icc_hh_within_psu  <- sigma2_hh_3level / total_var
+```
+
+```{r bayes-3level-sensitivity}
+prior_3level <- c(
+  prior(normal(0, 2.5), class = "Intercept"),
+  prior(normal(0, 1),   class = "b"),
+  prior(normal(0, 1),   class = "sd", group = "psu_id"),
+  prior(normal(0, 1),   class = "sd", group = "psu_id:household_id")
+)
+
+model_bayes_3level <- brm(
+  update(f_fixed, . | weights(weight_norm) ~ . + (1 | psu_id/household_id)),
+  data    = analytic,
+  family  = bernoulli(),
+  prior   = prior_3level,
+  chains  = 4, iter = 4000, warmup = 2000,
+  control = list(adapt_delta = 0.95),
+  seed    = 123,
+  backend = "cmdstanr"
+)
+summary(model_bayes_3level)
+```
+
+
+```{r prior-sensitivity}
+prior_wide <- c(
+  prior(normal(0, 5),   class = "Intercept"),
+  prior(normal(0, 2.5), class = "b"),
+  prior(normal(0, 1),   class = "sd")
+)
+
+model_bayes_wide_prior <- brm(
+  update(f_fixed, . | weights(weight_norm) ~ . + (1 | psu_id)),
+  data    = analytic,
+  family  = bernoulli(),
+  prior   = prior_wide,
+  chains  = 4, iter = 4000, warmup = 2000,
+  control = list(adapt_delta = 0.95),
+  seed    = 456,
+  backend = "cmdstanr"
+)
+
+extract_fe <- function(model, label) {
+  fixef(model) |>
+    as.data.frame() |>
+    rownames_to_column("Parameter") |>
+    filter(Parameter != "Intercept") |>
+    transmute(
+      Parameter,
+      Estimate  = Estimate,
+      Q2.5      = Q2.5,
+      Q97.5     = Q97.5,
+      Prior     = label
+    )
+}
+
+prior_sensitivity_table <- bind_rows(
+  extract_fe(model_bayes_2level,     "Base prior: N(0,1) slopes"),
+  extract_fe(model_bayes_wide_prior, "Wide prior: N(0,2.5) slopes")
+) |>
+  mutate(Est_CI = sprintf("%.3f (%.3f, %.3f)", Estimate, Q2.5, Q97.5)) |>
+  select(Parameter, Prior, Est_CI) |>
+  pivot_wider(names_from = Prior, values_from = Est_CI)
+
+prior_sensitivity_diff <- bind_rows(
+  extract_fe(model_bayes_2level,     "base"),
+  extract_fe(model_bayes_wide_prior, "wide")
+) |>
+  select(Parameter, Estimate, Prior) |>
+  pivot_wider(names_from = Prior, values_from = Estimate) |>
+  mutate(abs_diff = abs(base - wide)) |>
+  arrange(desc(abs_diff))
+
+prior_sensitivity_diff
+
+prior_sensitivity_plot <- bind_rows(
+  extract_fe(model_bayes_2level,     "Base prior"),
+  extract_fe(model_bayes_wide_prior, "Wide prior")
+) |>
+  filter(Parameter %in% c(
+    "Age_s60-70", "bmi_catObese", "has_diabetesYes",
+    "high_alcohol_intakeYes", "Age_s50-59"
+  )) |>
+  ggplot(aes(x = Estimate, xmin = Q2.5, xmax = Q97.5,
+             y = Parameter, colour = Prior)) +
+  geom_pointrange(position = position_dodge(width = 0.4)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey50") +
+  labs(title  = "Prior sensitivity: key parameters",
+       subtitle = "Log-odds scale; base vs wide prior",
+       x = "Posterior median (95% CrI)",
+       y = NULL, colour = "Prior specification") +
+  theme_minimal()
+
+prior_sensitivity_plot
+```
+
+
+```{r freq-cluster-preds}
+cluster_specific_preds_freq <- analytic |>
+  mutate(
+    pred_cluster_specific = predict(model_freq_2level, re.form = NULL, type = "response"),
+    pred_population_avg   = predict(model_freq_2level, re.form = NA,   type = "response")
+  )
+
+psu_risks_freq <- cluster_specific_preds_freq |>
+  group_by(psu_id) |>
+  summarise(mean_cluster_risk = mean(pred_cluster_specific),
+            mean_pop_risk     = mean(pred_population_avg),
+            .groups = "drop")
+summary(psu_risks_freq$mean_cluster_risk)
+```
+
+```{r bayes-cluster-preds}
+cluster_preds_bayes <- posterior_epred(model_bayes_2level, newdata = analytic,
+                                       ndraws = 500, re_formula = NULL)
+pop_preds_bayes     <- posterior_epred(model_bayes_2level, newdata = analytic,
+                                       ndraws = 500, re_formula = NA)
+
+psu_risks_bayes <- analytic |>
+  mutate(
+    median_cluster_risk = apply(cluster_preds_bayes, 2, median),
+    lower_cluster_risk  = apply(cluster_preds_bayes, 2, quantile, 0.025),
+    upper_cluster_risk  = apply(cluster_preds_bayes, 2, quantile, 0.975),
+    median_pop_risk     = apply(pop_preds_bayes, 2, median)
+  ) |>
+  group_by(psu_id) |>
+  summarise(mean_cluster_risk  = mean(median_cluster_risk),
+            lower_cluster_risk = mean(lower_cluster_risk),
+            upper_cluster_risk = mean(upper_cluster_risk),
+            mean_pop_risk      = mean(median_pop_risk),
+            .groups = "drop")
+summary(psu_risks_bayes$mean_cluster_risk)
+```
+
+```{r cluster-rr}
+calc_cluster_specific_rr <- function(model, data, exposure_var,
+                                     reference_level, is_bayesian = FALSE) {
+  exposure_levels <- c(reference_level,
+                       setdiff(unique(data[[exposure_var]]), reference_level))
+  bind_rows(lapply(unique(data$psu_id), function(cl) {
+    cd <- data |> filter(psu_id == cl)
+    if (nrow(cd) < 5) return(NULL)
+    risks <- sapply(exposure_levels, function(lv) {
+      cd_cf <- cd; cd_cf[[exposure_var]] <- lv
+      if (is_bayesian) {
+        mean(colMeans(posterior_epred(model, newdata = cd_cf,
+                                      ndraws = 500, re_formula = NULL)))
+      } else {
+        mean(predict(model, newdata = cd_cf, type = "response"))
+      }
+    })
+    tibble(psu_id = cl, exposure_level = exposure_levels,
+           cluster_rr = risks / risks[1])
+  }))
+}
+
+cluster_rr_diabetes_bayes <- calc_cluster_specific_rr(
+  model_bayes_2level, analytic,
+  exposure_var    = "has_diabetes",
+  reference_level = "No",
+  is_bayesian     = TRUE
+)
+
+cluster_rr_summary <- cluster_rr_diabetes_bayes |>
+  filter(exposure_level == "Yes") |>
+  summarise(n_clusters = n(), mean_rr = mean(cluster_rr),
+            median_rr = median(cluster_rr), sd_rr = sd(cluster_rr),
+            min_rr = min(cluster_rr), max_rr = max(cluster_rr),
+            q25 = quantile(cluster_rr, 0.25), q75 = quantile(cluster_rr, 0.75))
+cluster_rr_summary
+
+pop_avg_diabetes_rr <- bayes_RRs |>
+  filter(str_detect(term, "diabetes")) |> pull(estimate)
+
+cluster_comparisons_bayes <- avg_comparisons(
+  model_bayes_2level,
+  variables = list(
+    has_diabetes          = c("No","Yes"),
+    Age_s                 = "reference",
+    bmi_cat               = "reference",
+    current_smoker        = c("No","Yes"),
+    Region                = "reference",
+    high_alcohol_intake   = c("No","Yes"),
+    Education             = "reference",
+    high_fat_intake       = c("No","Yes"),
+    high_salt_intake      = c("No","Yes"),
+    insufficient_activity = c("No","Yes"),
+    Residence             = c("Urban","Rural"),
+    Sex                   = c("Male","Female"),
+    wealth                = "reference"
+  ),
+  comparison = "ratio", by = "psu_id",
+  wts = analytic$weight_norm, ndraws = 500
+) |> as.data.frame()
+
+cluster_variation_summary <- cluster_comparisons_bayes |>
+  summarise(n_clusters = n(), mean_rr = mean(estimate),
+            median_rr  = median(estimate), sd_rr = sd(estimate),
+            cv = sd_rr / mean_rr, iqr = IQR(estimate))
+cluster_variation_summary
+```
+
+
+```{r table-objective-2}
+table_objective_2 <- tibble(
+  Parameter = c(
+    "ICC (PSU level) — Frequentist",
+    "ICC (PSU level) — Bayesian",
+    "",
+    "Population-Avg RR (Diabetes)",
+    "Median Cluster-Specific RR (Diabetes)",
+    "Range of Cluster RRs",
+    "SD of Cluster RRs",
+    "Coefficient of Variation"
+  ),
+  Estimate = c(
+    sprintf("%.4f", icc_psu_freq),
+    sprintf("%.4f [%.4f, %.4f]",
+            icc_psu_bayes$icc, icc_psu_bayes$.lower, icc_psu_bayes$.upper),
+    "",
+    sprintf("%.2f", pop_avg_diabetes_rr),
+    sprintf("%.2f", cluster_rr_summary$median_rr),
+    sprintf("%.2f \u2013 %.2f", cluster_rr_summary$min_rr, cluster_rr_summary$max_rr),
+    sprintf("%.2f", cluster_rr_summary$sd_rr),
+    sprintf("%.2f", cluster_variation_summary$cv)
+  )
+) |>
+  gt() |>
+  tab_style(style = cell_text(weight = "bold"),
+            locations = cells_body(rows = Parameter == "")) |>
+  tab_footnote("ICC quantifies the proportion of variance at the enumeration-area level.",
+               locations = cells_body(columns = Parameter, rows = 1:2))
+
+table_objective_2
+```
+
+
+```{r misclass-descriptive}
+misclass_components <- data1 |>
+  summarise(n = n(),
+            composite_htn  = sum(hypertension       == 1, na.rm = TRUE),
+            measured_only  = sum(htn_measured_only  == 1, na.rm = TRUE),
+            diagnosed_only = sum(htn_diagnosed_only == 1, na.rm = TRUE),
+            treated_only   = sum(htn_treated_only   == 1, na.rm = TRUE)) |>
+  mutate(across(ends_with("_only") | starts_with("composite"),
+                list(prev = ~. / n * 100)))
+misclass_components
+
+cross_tab <- data1 |>
+  mutate(detection_method = case_when(
+    htn_measured_only == 1 & htn_diagnosed_only == 0 & htn_treated_only == 0 ~ "Measured only",
+    htn_diagnosed_only == 1 & htn_measured_only == 0                         ~ "Diagnosed only",
+    htn_treated_only   == 1 & htn_measured_only == 0                         ~ "Treated only",
+    htn_measured_only == 1  & htn_diagnosed_only == 1                        ~ "Measured + Diagnosed",
+    htn_measured_only == 1  & htn_treated_only   == 1                        ~ "Measured + Treated",
+    hypertension == 1                                                          ~ "Multiple components",
+    TRUE ~ "No hypertension"
+  )) |>
+  count(detection_method) |>
+  mutate(pct = n / sum(n) * 100)
+cross_tab
+```
+
+
+```{r sensitivity-analysis, cache=TRUE}
+analytic <- analytic |>
+  mutate(
+    across(where(is.character), ~ str_replace_all(.x, "([A-Za-z])-([A-Za-z])", "\\1–\\2")),
+    across(where(is.factor), ~ {
+      cleaned <- str_replace_all(as.character(.x), "([A-Za-z])-([A-Za-z])", "\\1–\\2")
+      factor(cleaned, levels = unique(cleaned))
+    })
+  )
+
+outcomes_to_test       <- c("hypertension","htn_measured_only","htn_diagnosed_only")
+sensitivity_results_all <- list()
+
+for (outcome in outcomes_to_test) {
+  
+  data_sens <- analytic |>
+  mutate(outcome_var = .data[[outcome]]) |>
+  filter(!is.na(outcome_var))
+
+  model_sens <- brm(
+    update(f_fixed, outcome_var | weights(weight_norm) ~ . + (1 | psu_id)),
+    data    = data_sens,
+    family  = bernoulli(),
+    prior   = prior_2level,
+    chains  = 2, iter = 2000, warmup = 1000,
+    seed    = 123,
+    backend = "cmdstanr",
+    refresh = 0,
+    file    = paste0("model_sens_", outcome)
+  )
+
+  rr_coefs <- avg_comparisons(
+    model_sens,
+    newdata     = data_sens,
+    comparison  = "ratio",
+    conf_level  = 0.95,
+    wts         = "weight_norm",
+    ndraws      = 500
+  ) |>
+    as.data.frame() |>
+    transmute(
+      Parameter          = paste0(term, ": ", contrast),
+      outcome_definition = outcome,
+      RR                 = estimate,
+      RR_lower           = conf.low,
+      RR_upper           = conf.high,
+      RR_CI              = sprintf("%.2f (%.2f, %.2f)", RR, RR_lower, RR_upper)
+    )
+
+  sensitivity_results_all[[outcome]] <- rr_coefs
+}
+
+sensitivity_comparison_rr <- bind_rows(sensitivity_results_all) |>
+  mutate(outcome_label = case_when(
+    outcome_definition == "hypertension"       ~ "Composite RR (95% CI)",
+    outcome_definition == "htn_measured_only"  ~ "Measured Only RR (95% CI)",
+    outcome_definition == "htn_diagnosed_only" ~ "Diagnosed Only RR (95% CI)"
+  )) |>
+  select(Parameter, outcome_label, RR_CI) |>
+  pivot_wider(names_from = outcome_label, values_from = RR_CI)
+
+sensitivity_comparison_rr
+```
+
+ 
+```{r stan-bias-model, cache=TRUE}
+stan_misclass_code <- "
+data {
+  int<lower=0> N;
+  int<lower=0> K;
+  matrix[N, K] X;
+  array[N] int<lower=0,upper=1> y_obs;
+  vector[N] weights;
+  real<lower=0> sens_alpha; real<lower=0> sens_beta;
+  real<lower=0> spec_alpha; real<lower=0> spec_beta;
+}
+parameters {
+  vector[K] beta;
+  real<lower=0,upper=1> sensitivity;
+  real<lower=0,upper=1> specificity;
+}
+transformed parameters {
+  vector[N] pi_true;
+  pi_true = inv_logit(X * beta);
+}
+model {
+  beta        ~ normal(0, 1);
+  sensitivity ~ beta(sens_alpha, sens_beta);
+  specificity ~ beta(spec_alpha, spec_beta);
+  for (n in 1:N) {
+    real p_obs_1 = pi_true[n] * sensitivity + (1 - pi_true[n]) * (1 - specificity);
+    if (y_obs[n] == 1) target += weights[n] * log(p_obs_1);
+    else               target += weights[n] * log(1 - p_obs_1);
+  }
+}
+generated quantities {
+  vector[N] y_true_prob;
+  real prev_observed = dot_product(to_vector(y_obs), weights) / sum(weights);
+  real prev_true     = dot_product(pi_true, weights) / sum(weights);
+  for (n in 1:N) {
+    real p_obs_1 = pi_true[n] * sensitivity + (1 - pi_true[n]) * (1 - specificity);
+    if (y_obs[n] == 1) y_true_prob[n] = (pi_true[n] * sensitivity) / p_obs_1;
+    else               y_true_prob[n] = (pi_true[n] * (1 - sensitivity)) / (1 - p_obs_1);
+  }
+}
+"
+
+X_matrix <- model.matrix(
+  ~ Age_s + Sex + bmi_cat + has_diabetes +
+    current_smoker + high_alcohol_intake + high_fat_intake +
+    high_salt_intake + Education + wealth +
+    Residence + insufficient_activity + Region,
+  data = analytic
+)
+beta_names <- colnames(X_matrix)
+
+stan_data <- list(
+  N = nrow(X_matrix), K = ncol(X_matrix),
+  X = X_matrix, y_obs = analytic$hypertension,
+  weights    = analytic$weight_norm,
+  sens_alpha = 85, sens_beta = 15,
+  spec_alpha = 90, spec_beta = 10
+)
+
+stan_file      <- write_stan_file(stan_misclass_code)
+model_compiled <- cmdstan_model(stan_file)
+
+fit_misclass <- model_compiled$sample(
+  data = stan_data, chains = 4, parallel_chains = 4,
+  iter_warmup = 2000, iter_sampling = 2000,
+  seed = 123, adapt_delta = 0.95
+)
+fit_misclass$cmdstan_diagnose()
+```
+
+
+```{r bias-posteriors}
+draws_misclass  <- fit_misclass$draws(format = "df")
+sens_spec_summary <- fit_misclass$summary(
+  variables = c("sensitivity","specificity","prev_observed","prev_true")
+)
+sens_spec_summary
+
+sens_draws <- draws_misclass$sensitivity
+spec_draws <- draws_misclass$specificity
+
+p1 <- ggplot(data.frame(x = sens_draws), aes(x)) +
+  geom_density(fill = "steelblue", alpha = 0.6) +
+  geom_vline(xintercept = mean(sens_draws), colour = "red", linetype = "dashed") +
+  labs(title = "Posterior: Sensitivity", x = "Sensitivity", y = "Density") +
+  theme_minimal()
+p2 <- ggplot(data.frame(x = spec_draws), aes(x)) +
+  geom_density(fill = "darkgreen", alpha = 0.6) +
+  geom_vline(xintercept = mean(spec_draws), colour = "red", linetype = "dashed") +
+  labs(title = "Posterior: Specificity", x = "Specificity", y = "Density") +
+  theme_minimal()
+p1 + p2
+```
+
+```{r bias-corrected-rr}
+compute_marginal_rr_stan <- function(draws_df, X_mat, beta_cols,
+                                     col_index, weights = NULL) {
+  if (is.null(weights)) weights <- rep(1, nrow(X_mat))
+  w        <- weights / sum(weights)
+  beta_mat <- as.matrix(draws_df[, beta_cols])
+  X1 <- X0 <- X_mat
+  X1[, col_index] <- 1
+  X0[, col_index] <- 0
+  p1 <- as.vector(plogis(beta_mat %*% t(X1)) %*% w)
+  p0 <- as.vector(plogis(beta_mat %*% t(X0)) %*% w)
+  rr <- p1 / p0
+  tibble(mean_rr  = mean(rr),
+         lower_rr = quantile(rr, 0.025),
+         upper_rr = quantile(rr, 0.975))
+}
+
+beta_cols <- paste0("beta[", seq_along(beta_names), "]")
+
+key_params_rr <- map_dfr(seq(2, length(beta_names)), function(j) {
+  rr <- compute_marginal_rr_stan(draws_misclass, X_matrix, beta_cols, j,
+                                 analytic$weight_norm)
+  tibble(Parameter = beta_names[j], rr)
+}) |>
+  transmute(
+    Parameter,
+    BiasCorr_RR    = mean_rr,
+    BC_lower       = lower_rr,
+    BC_upper       = upper_rr,
+    RR_CI          = sprintf("%.2f (%.2f, %.2f)", mean_rr, lower_rr, upper_rr)
+  ) |>
+  arrange(desc(abs(BiasCorr_RR - 1)))
+
+table_objective_3b_rr <- key_params_rr |>
+  mutate(across(where(is.numeric), ~round(.x, 3))) |>
+  gt() |>
+  tab_header(
+    title    = "Bias-Corrected Marginal Risk Ratios",
+    subtitle = "G-computation over Stan posterior draws; ordered by deviation from null"
+  ) |>
+  cols_label(Parameter = "Parameter", BiasCorr_RR = "Bias-Corrected RR",
+             BC_lower = "95% CrI Lower", BC_upper = "95% CrI Upper",
+             RR_CI = "RR (95% CrI)") |>
+  tab_footnote("RRs from G-computation (recycled predictions) with survey weights.",
+               locations = cells_column_labels(columns = RR_CI))
+
+table_objective_3b_rr
+```
+
+```{r bias-prevalence-table}
+table_objective_3a <- tibble(
+  Analysis = c(
+    "Composite Definition Prevalence", "Measured BP Only Prevalence",
+    "Prior Diagnosis Only Prevalence", "",
+    "Estimated Sensitivity (Mean [95% CrI])",
+    "Estimated Specificity (Mean [95% CrI])", "",
+    "True Prevalence (Bias-Corrected)", "Observed Prevalence"
+  ),
+  Value = c(
+    sprintf("%.1f%%", misclass_components$composite_htn / misclass_components$n * 100),
+    sprintf("%.1f%%", misclass_components$measured_only / misclass_components$n * 100),
+    sprintf("%.1f%%", misclass_components$diagnosed_only / misclass_components$n * 100),
+    "",
+    sprintf("%.3f [%.3f, %.3f]", sens_spec_summary$mean[1],
+            sens_spec_summary$q5[1], sens_spec_summary$q95[1]),
+    sprintf("%.3f [%.3f, %.3f]", sens_spec_summary$mean[2],
+            sens_spec_summary$q5[2], sens_spec_summary$q95[2]),
+    "",
+    sprintf("%.3f [%.3f, %.3f]", sens_spec_summary$mean[4],
+            sens_spec_summary$q5[4], sens_spec_summary$q95[4]),
+    sprintf("%.3f [%.3f, %.3f]", sens_spec_summary$mean[3],
+            sens_spec_summary$q5[3], sens_spec_summary$q95[3])
+  )
+) |>
+  gt() |>
+  tab_header(title = "Probabilistic Bias Analysis",
+             subtitle = "Misclassification correction for hypertension outcome")
+table_objective_3a
+```
+
+
+```{r stability-grid, cache=TRUE}
+sensitivity_grid <- expand_grid(
+  sensitivity = seq(0.70, 0.95, by = 0.05),
+  specificity = seq(0.80, 0.98, by = 0.03)
+)
+
+sens_analysis_results <- list()
+
+for (i in seq_len(nrow(sensitivity_grid))) {
+  if (i %% 10 == 0) cat("Scenario", i, "of", nrow(sensitivity_grid), "\n")
+
+  sens_val <- sensitivity_grid$sensitivity[i]
+  spec_val <- sensitivity_grid$specificity[i]
+
+  sd_s <- stan_data
+  sd_s$sens_alpha <- sens_val * 1000; sd_s$sens_beta <- (1 - sens_val) * 1000
+  sd_s$spec_alpha <- spec_val * 1000; sd_s$spec_beta <- (1 - spec_val) * 1000
+
+  fit_s <- model_compiled$sample(
+    data = sd_s, chains = 2, parallel_chains = 2,
+    iter_warmup = 1000, iter_sampling = 1000,
+    seed = 123 + i, refresh = 0, show_messages = FALSE
+  )
+
+  draws_s <- fit_s$draws(format = "df")
+
+  scenario_rrs <- map_dfr(seq(2, length(beta_names)), function(j) {
+    rr <- compute_marginal_rr_stan(draws_s, X_matrix, beta_cols, j,
+                                   analytic$weight_norm)
+    tibble(Parameter = beta_names[j],
+           sensitivity = sens_val, specificity = spec_val,
+           RR = rr$mean_rr, RR_lower = rr$lower_rr, RR_upper = rr$upper_rr)
+  })
+
+  sens_analysis_results[[i]] <- scenario_rrs
+}
+
+sens_results_df <- bind_rows(sens_analysis_results)
+
+sens_summary_rr <- sens_results_df |>
+  group_by(Parameter) |>
+  summarise(mean_RR  = mean(RR),  sd_RR   = sd(RR),
+            min_RR   = min(RR),   max_RR  = max(RR),
+            range_RR = max_RR - min_RR,
+            cv_RR    = sd_RR / mean_RR,
+            .groups  = "drop") |>
+  arrange(desc(cv_RR))
+
+table_objective_3c <- sens_summary_rr |>
+  mutate(across(where(is.numeric), ~round(.x, 3))) |>
+  gt() |>
+  tab_header(
+    title    = "RR Stability Across Misclassification Scenarios",
+    subtitle = "Sensitivity range 70-95%, Specificity range 80-98%"
+  ) |>
+  cols_label(Parameter = "Parameter", mean_RR = "Mean RR", sd_RR = "SD",
+             min_RR = "Min RR", max_RR = "Max RR",
+             range_RR = "Range", cv_RR = "CV") |>
+  tab_footnote("CV = coefficient of variation. Higher CV = greater sensitivity to misclassification assumptions.",
+               locations = cells_column_labels(columns = cv_RR))
+
+table_objective_3c
+```
+
+
+```{r cv-setup}
+calc_cv_metrics <- function(predictions, observed, weights = NULL) {
+  if (is.null(weights)) weights <- rep(1, length(observed))
+  weights <- weights / sum(weights) * length(observed)
+
+  brier    <- weighted.mean((predictions - observed)^2, weights)
+  log_loss <- -weighted.mean(
+    observed * log(predictions + 1e-10) +
+      (1 - observed) * log(1 - predictions + 1e-10), weights)
+
+  lpd_i         <- observed * log(predictions + 1e-10) +
+                   (1 - observed) * log(1 - predictions + 1e-10)
+  elpd_total    <- sum(weights * lpd_i)
+  elpd_mean_obs <- weighted.mean(lpd_i, weights)
+
+  calib_data <- tibble(pred = predictions, obs = observed,
+                       weight = weights, pred_decile = ntile(pred, 10)) |>
+    group_by(pred_decile) |>
+    summarise(mean_pred = weighted.mean(pred, weight),
+              mean_obs  = weighted.mean(obs,  weight),
+              n = n(), .groups = "drop") |>
+    filter(n >= 5)
+
+  if (nrow(calib_data) > 2) {
+    cm              <- lm(mean_obs ~ mean_pred, data = calib_data)
+    calib_intercept <- coef(cm)[1]
+    calib_slope     <- coef(cm)[2]
+  } else {
+    calib_intercept <- NA; calib_slope <- NA
+  }
+
+  roc_data <- tibble(pred = predictions, obs = observed) |>
+    arrange(desc(pred)) |>
+    mutate(tpr = cumsum(obs)     / sum(obs),
+           fpr = cumsum(1 - obs) / sum(1 - obs))
+  auc <- sum(diff(roc_data$fpr) *
+               (head(roc_data$tpr, -1) + tail(roc_data$tpr, -1)) / 2)
+
+  list(brier = brier, log_loss = log_loss,
+       elpd_total = elpd_total, elpd_mean_obs = elpd_mean_obs,
+       calib_intercept = calib_intercept, calib_slope = calib_slope,
+       auc = auc, calibration_data = calib_data)
+}
+
+set.seed(123)
+psu_prevalence <- analytic |>
+  group_by(psu_id) |>
+  summarise(prev = mean(hypertension)) |>
+  mutate(prev_quartile = ntile(prev, 4))
+
+fold_assignment <- psu_prevalence |>
+  group_by(prev_quartile) |>
+  mutate(fold = sample(rep(1:10, length.out = n()))) |>
+  ungroup() |>
+  select(psu_id, fold)
+
+cv_data <- analytic |> left_join(fold_assignment, by = "psu_id")
+n_folds <- 10
+```
+
+```{r cv-loop, cache=TRUE}
+models_to_compare <- c("Freq_Logistic","Freq_Poisson","Bayes_Single",
+                        "Bayes_2Level","Bayes_3Level")
+cv_results_all <- list()
+
+for (model_name in models_to_compare) {
+  cat("Cross-validating:", model_name, "\n")
+  cv_fold_results <- list()
+
+  for (fold_i in 1:n_folds) {
+    cat("  Fold", fold_i, "/", n_folds, "\n")
+    train_data <- cv_data |> filter(fold != fold_i)
+    test_data  <- cv_data |> filter(fold == fold_i)
+
+    if (model_name == "Freq_Logistic") {
+      train_svy  <- svydesign(ids = ~psu, strata = ~stratum,
+                               weights = ~wstep3, data = train_data, nest = TRUE)
+      model_fold <- svyglm(update(f_fixed, . ~ .),
+                            design = train_svy, family = quasibinomial())
+      preds <- predict(model_fold, newdata = test_data, type = "response")
+
+    } else if (model_name == "Freq_Poisson") {
+      train_svy  <- svydesign(ids = ~psu, strata = ~stratum,
+                               weights = ~wstep3, data = train_data, nest = TRUE)
+      model_fold <- svyglm(update(f_fixed, . ~ .),
+                            design = train_svy, family = quasipoisson())
+      preds <- pmin(predict(model_fold, newdata = test_data, type = "response"), 1)
+
+    } else if (model_name == "Bayes_Single") {
+      model_fold <- brm(
+        update(f_fixed, . | weights(weight_norm) ~ .),
+        data = train_data, family = bernoulli(),
+        prior = prior_single,
+        chains = 2, iter = 1500, warmup = 750,
+        seed = 123 + fold_i, refresh = 0, backend = "cmdstanr")
+      preds <- colMeans(posterior_epred(model_fold, newdata = test_data, ndraws = 500))
+
+    } else if (model_name == "Bayes_2Level") {
+      model_fold <- brm(
+        update(f_fixed, . | weights(weight_norm) ~ . + (1 | psu_id)),
+        data = train_data, family = bernoulli(),
+        prior = prior_2level,
+        chains = 2, iter = 1500, warmup = 750,
+        seed = 123 + fold_i, refresh = 0, backend = "cmdstanr")
+      preds <- colMeans(posterior_epred(model_fold, newdata = test_data,
+                                        ndraws = 500, allow_new_levels = TRUE))
+
+    } else if (model_name == "Bayes_3Level") {
+      model_fold <- brm(
+        update(f_fixed, . | weights(weight_norm) ~ . + (1 | psu_id/household_id)),
+        data = train_data, family = bernoulli(),
+        prior = prior_3level,
+        chains = 2, iter = 1500, warmup = 750,
+        control = list(adapt_delta = 0.95),
+        seed = 123 + fold_i, refresh = 0, backend = "cmdstanr")
+      preds <- colMeans(posterior_epred(model_fold, newdata = test_data,
+                                        ndraws = 500, allow_new_levels = TRUE))
+    }
+
+    metrics <- calc_cv_metrics(preds, test_data$hypertension, test_data$weight_norm)
+
+    cv_fold_results[[fold_i]] <- tibble(
+      model           = model_name, fold = fold_i,
+      n_train         = nrow(train_data), n_test = nrow(test_data),
+      brier           = metrics$brier,
+      log_loss        = metrics$log_loss,
+      calib_intercept = metrics$calib_intercept,
+      calib_slope     = metrics$calib_slope,
+      auc             = metrics$auc,
+      elpd_total      = metrics$elpd_total,
+      elpd_mean_obs   = metrics$elpd_mean_obs
+    )
+  }
+
+  cv_results_all[[model_name]] <- bind_rows(cv_fold_results)
+}
+```
+
+```{r cv-table}
+table_objective_4_data <- cv_results_all |>
+  bind_rows() |>
+  group_by(model) |>
+  summarise(
+    Brier       = sprintf("%.4f (%.4f)", mean(brier),    sd(brier)    / sqrt(n())),
+    LogLoss     = sprintf("%.3f (%.3f)", mean(log_loss), sd(log_loss) / sqrt(n())),
+    AUC         = sprintf("%.3f (%.3f)", mean(auc),      sd(auc)      / sqrt(n())),
+    Calib_Slope = sprintf("%.2f (%.2f)", mean(calib_slope, na.rm = TRUE),
+                                          sd(calib_slope,  na.rm = TRUE) / sqrt(n())),
+    ELPD        = sprintf("%.4f (%.5f)", mean(elpd_mean_obs),
+                                          sd(elpd_mean_obs) / sqrt(n())),
+    .groups = "drop"
+  ) |>
+  arrange(desc(model)) |>
+  as.data.frame()
+
+table_objective_4 <- table_objective_4_data |>
+  gt() |>
+  cols_label(
+    model       = "Model Type",
+    Brier       = "Brier Score",
+    LogLoss     = "Log Loss",
+    AUC         = "AUC",
+    Calib_Slope = "Calibration Slope",
+    ELPD        = "Mean lpd per obs"
+  ) |>
+  tab_style(
+    style     = cell_text(weight = "bold"),
+    locations = cells_column_labels()
+  ) |>
+  tab_footnote(
+    "Values are mean (SE across 10 CV folds). ELPD = mean per-observation log predictive density; higher is better.",
+    locations = cells_title()
+  )
+
+table_objective_4
+```
+
+```{r within-framework-criteria}
+aic_logistic <- AIC(model_freq_logistic)
+aic_poisson  <- AIC(model_freq_poisson)
+aic_2level   <- AIC(model_freq_2level)
+aic_3level   <- AIC(model_freq_3level)
+
+waic_single <- waic(model_bayes_single)
+waic_2level <- waic(model_bayes_2level)
+waic_3level <- waic(model_bayes_3level)
+
+loo_single  <- loo(model_bayes_single)
+loo_2level  <- loo(model_bayes_2level)
+loo_3level  <- loo(model_bayes_3level)
+loo_compare(loo_single, loo_2level, loo_3level)
+```
+
+```{r paired-tests}
+cv_long <- bind_rows(cv_results_all) |> as.data.frame()
+
+cv_wide <- cv_long |>
+  select(model, fold, brier, log_loss, auc, calib_slope, elpd_mean_obs) |>
+  pivot_wider(
+    names_from  = model,
+    values_from = c(brier, log_loss, auc, calib_slope, elpd_mean_obs)
+  ) |>
+  as.data.frame()
+
+cv_wide_calib <- cv_wide |>
+  mutate(across(starts_with("calib_slope"),
+                ~abs(. - 1),
+                .names = "caldist_{.col}")) |>
+  rename_with(~str_remove(., "caldist_calib_slope_"),
+              starts_with("caldist_calib")) |>
+  as.data.frame()
+
+run_paired_tests <- function(metric_prefix, data, reference, comparisons) {
+  ref_col <- paste0(metric_prefix, "_", reference)
+
+  ref_vals <- as.numeric(data[, ref_col])
+
+  map_dfr(comparisons, function(comp) {
+    comp_col  <- paste0(metric_prefix, "_", comp)
+    comp_vals <- as.numeric(data[, comp_col])
+    diff_vals <- ref_vals - comp_vals
+
+    t_r <- t.test(ref_vals, comp_vals, paired = TRUE)
+    w_r <- wilcox.test(ref_vals, comp_vals, paired = TRUE, exact = FALSE)
+
+    tibble(
+      Metric    = metric_prefix,
+      Comparison = comp,
+      Mean_Diff = mean(diff_vals),
+      SE_Diff   = sd(diff_vals) / sqrt(length(diff_vals)),
+      CI_lower  = t_r$conf.int[1],
+      CI_upper  = t_r$conf.int[2],
+      t_p_value = t_r$p.value,
+      W_p_value = w_r$p.value
+    )
+  })
+}
+
+comparison_models <- c("Freq_Logistic","Freq_Poisson","Bayes_Single","Bayes_2Level")
+
+all_tests <- bind_rows(
+  run_paired_tests("elpd_mean_obs", cv_wide,       "Bayes_3Level", comparison_models),
+  run_paired_tests("caldist",       cv_wide_calib, "Bayes_3Level", comparison_models),
+  run_paired_tests("brier",         cv_wide,       "Bayes_3Level", comparison_models),
+  run_paired_tests("auc",           cv_wide,       "Bayes_3Level", comparison_models)
+) |>
+  mutate(
+    Sig_t = t_p_value < 0.05,
+    Sig_W = W_p_value < 0.05,
+    Conclusion = case_when(
+      !Sig_t & !Sig_W       ~ "No significant difference",
+      Sig_t & Mean_Diff > 0 ~ "Bayes_3Level significantly better",
+      Sig_t & Mean_Diff < 0 ~ "Comparison significantly better",
+      TRUE                  ~ "Mixed evidence"
+    )
+  )
+
+all_tests |>
+  mutate(
+    across(where(is.numeric), ~round(.x, 4)),
+    CI = sprintf("[%.4f, %.4f]", CI_lower, CI_upper)
+  ) |>
+  select(Metric, Comparison, Mean_Diff, SE_Diff, CI,
+         t_p_value, W_p_value, Conclusion) |>
+  as.data.frame() |>
+  gt() |>
+  tab_header(
+    "Paired Fold-Wise Tests: Bayes_3Level vs All Models",
+    subtitle = "Paired t-test and Wilcoxon signed-rank across 10 CV folds"
+  ) |>
+  cols_label(t_p_value = "p (t-test)", W_p_value = "p (Wilcoxon)") |>
+  tab_footnote(
+    "With only 10 folds, non-significance = insufficient evidence, not equivalence.",
+    locations = cells_title()
+  )
+```
